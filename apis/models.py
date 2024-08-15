@@ -10,9 +10,9 @@ class User(AbstractUser):
 
 
 class Author(TimestampMixin):
-    id = models.CharField(max_length=50, primary_key=True)
+    id = models.CharField(max_length=500, primary_key=True)
     name = models.CharField(max_length=255)
-    gender = models.CharField(max_length=50, blank=True, null=True)
+    gender = models.CharField(max_length=500, blank=True, null=True)
     image_url = models.URLField(max_length=500, blank=True, null=True)
     about = models.TextField(blank=True, null=True)
     ratings_count = models.IntegerField(default=0)
@@ -28,10 +28,11 @@ class Author(TimestampMixin):
 
 
 class Book(TimestampMixin):
-    id = models.CharField(max_length=50, primary_key=True)
+    id = models.CharField(max_length=500, primary_key=True)
     title = models.CharField(max_length=500)
-    published_date = models.DateField()
-    isbn = models.CharField(max_length=13, unique=True)
+    authors = models.ManyToManyField(Author, related_name='books')
+    published_date = models.DateField(blank=True, null=True)  # Allow null values
+    isbn = models.CharField(max_length=130, unique=True)
     description = models.TextField(blank=True, null=True)
     tsv_description = models.TextField(blank=True, null=True)
     tsv_title = models.TextField(blank=True, null=True)
