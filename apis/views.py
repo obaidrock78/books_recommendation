@@ -1,8 +1,16 @@
+import ast
 import random
+from datetime import datetime
 
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel, cosine_similarity
+import faiss
+from django.db import connection
+
+from apis.models import Book
 from django.db.models import Q, Count
 from rest_framework.permissions import IsAuthenticated
-
+import numpy as np
 from apis.models import Book, User, Author
 from apis.serializers import BookSerializer, UserSignupSerializer, UserLoginSerializer, AuthorSerializer
 from common.response_mixins import BaseAPIView
@@ -13,6 +21,8 @@ from rest_framework.response import Response
 
 from .models import Book, Favorite
 from .serializers import BookSerializer, FavoriteSerializer
+
+
 class BooksAPIViewSet(BaseAPIView, ModelViewSet):
     queryset = Book.objects.all()
     serializer_class = BookSerializer
@@ -23,10 +33,9 @@ class BooksAPIViewSet(BaseAPIView, ModelViewSet):
         search_query = self.request.query_params.get('search', None)
         if search_query:
             queryset = queryset.filter(
-                Q(title__icontains=search_query) |
-                Q(author__name__icontains=search_query)
+                Q(title__icontains=search_query)
             )
-        return queryset
+        return queryset[:10]
 
 
 class AuthorAPIViewSet(BaseAPIView, ModelViewSet):
@@ -99,30 +108,129 @@ class FavoriteBooksAPIViewSet(ModelViewSet):
             return Response({"error": "Max of 20 favorite books allowed."}, status=400)
 
         favorite, created = Favorite.objects.get_or_create(user=user, book_id=book_id)
-        if not created:
-            return Response({"error": "Book is already in your favorites."}, status=400)
+        # if not created:
+        #     return Response({"error": "Book is already in your favorites."}, status=400)
 
-        recommendations = self.get_recommendations(user)
+        recommendations = self.get_recommendations(favorite.book.tsv_description)
         serializer = self.get_serializer(favorite)
         return Response({
             "favorite": serializer.data,
             "recommendations": BookSerializer(recommendations, many=True).data
         })
 
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        self.perform_destroy(instance)
-        return Response(status=204)
+    def get_recommendations(self, favorite_descriptions):
+        start_time = datetime.now()
+        print(f"start time {start_time}")
+        if isinstance(favorite_descriptions, str):
+            favorite_descriptions = [favorite_descriptions]
 
-    def get_recommendations(self, user):
-        favorite_books = user.favorites.all().values_list('book_id', flat=True)
-        if not favorite_books:
-            return []
+        # Escape special characters and join descriptions into a tsquery format
+        def format_query(descriptions):
+            formatted_descriptions = []
+            for desc in descriptions:
+                # Escape single quotes and format as tsquery term
+                formatted_desc = desc.replace("'", "''")
+                formatted_descriptions.append(f"'{formatted_desc}'")
+            return ' & '.join(formatted_descriptions)
 
-        # Simple similarity algorithm based on common author or genres (can be expanded)
-        recommended_books = Book.objects.exclude(id__in=favorite_books).filter(
-            Q(author__books__in=favorite_books) |
-            Q(title__icontains=random.choice(user.favorites.all()).book.title.split()[0])
-        ).distinct().annotate(num_favorites=Count('favorited_by')).order_by('-num_favorites')[:5]
+        ts_query = format_query(favorite_descriptions)
 
+        # Perform the search using raw SQL
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, title, ts_rank(tsv_description, plainto_tsquery(%s)) AS rank
+                FROM apis_book
+                WHERE ts_rank(tsv_description, to_tsquery(%s)) > 0
+                ORDER BY rank DESC
+                LIMIT 5
+            """, [ts_query, ts_query])
+
+            results = cursor.fetchall()
+
+        # Fetch recommended books
+        recommended_books = []
+        for book_id, title, rank in results:
+            book = Book.objects.get(id=book_id)
+            recommended_books.append(book)
+        print(f"end time {datetime.now() - start_time}")
         return recommended_books
+
+    # def get_recommendations(self, favorite_descriptions):
+    #     # Fetch books and their descriptions
+    #     books = list(Book.objects.all())  # Convert QuerySet to list
+    #     all_books = [book.description for book in books]
+    #     if isinstance(favorite_descriptions, str):
+    #         favorite_descriptions = [favorite_descriptions]
+    #
+    #     # Load or initialize the TF-IDF vectorizer
+    #     vectorizer = TfidfVectorizer()
+    #
+    #     # Fit the vectorizer on all book descriptions
+    #     vectorizer.fit(all_books)
+    #
+    #     # Transform favorite descriptions and all books to TF-IDF vectors
+    #     favorite_vectors = vectorizer.transform(favorite_descriptions)
+    #     all_vectors = vectorizer.transform(all_books)
+    #
+    #     # Compute cosine similarity
+    #     cosine_sim = linear_kernel(favorite_vectors, all_vectors)
+    #     avg_similarities = cosine_sim.mean(axis=0)
+    #
+    #     # Get top 5 book indices with highest similarity
+    #     similar_books_indices = avg_similarities.argsort()[-5:][::-1]
+    #
+    #     # Fetch books from list
+    #     recommended_books = [books[i] for i in similar_books_indices]
+    #
+    #     return recommended_books
+
+    # def get_recommendations(self, favorite_descriptions):
+    #     # Fetch all books and their precomputed TF-IDF vectors
+    #     all_books = list(Book.objects.filter(description__isnull=False)[:100])  # Convert QuerySet to list
+    #     all_vectors = np.array([book.tsv_description for book in all_books if book.tsv_description])
+    #
+    #     # Convert favorite_descriptions to a NumPy array if not already
+    #     if not isinstance(favorite_descriptions, np.ndarray):
+    #         favorite_descriptions = np.array(favorite_descriptions)
+    #
+    #     vectorizer = TfidfVectorizer()
+    #     vectorizer.fit(all_vectors)
+    #     vectorizer.fit(favorite_descriptions)
+    #
+    #     # Calculate similarity between favorite_vectors and all_vectors
+    #     similarities = cosine_similarity(favorite_descriptions, all_vectors)
+    #
+    #     # Get indices of books with highest similarity
+    #     similar_books_indices = similarities.argmax(axis=1)
+    #
+    #     # Fetch the recommended books based on similarity
+    #     recommended_books = [all_books[i] for i in similar_books_indices]
+    #
+    #     return recommended_books
+
+    # def get_recommendations(self, favorite_descriptions):
+    #     if isinstance(favorite_descriptions, str):
+    #         favorite_descriptions = [favorite_descriptions]
+    #
+    #     # Get all book descriptions
+    #     all_books = list(Book.objects.all())
+    #     all_descriptions = [book.description for book in all_books]
+    #
+    #     # Combine all descriptions for TF-IDF
+    #     tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
+    #     tfidf_matrix = tfidf.fit_transform(all_descriptions).toarray()
+    #
+    #     # Build FAISS index
+    #     index = faiss.IndexFlatL2(tfidf_matrix.shape[1])
+    #     index.add(tfidf_matrix)
+    #
+    #     # Transform favorite descriptions
+    #     favorite_matrix = tfidf.transform(favorite_descriptions).toarray()
+    #
+    #     # Search in FAISS index
+    #     D, I = index.search(favorite_matrix, 5)  # Get top 5 matches for each favorite
+    #
+    #     # Fetch books from list
+    #     recommended_books = [all_books[i] for i in I.flatten()]
+    #
+    #     return recommended_books
